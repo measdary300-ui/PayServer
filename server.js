@@ -45,7 +45,7 @@ const PAYWAY_API_KEY = (process.env.PAYWAY_API_KEY || '').trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
 const TOPUP_EXPIRY_MS = 10 * 60 * 1000; // 10 នាទី — បន្ទាប់ពីហ្នឹង topup នឹង expired
 const TOPUP_QR_EXPIRES_IN = 180;        // 180 វិនាទី — បង្ហាញក្នុង Mini App
-const ALLOWED_AMOUNTS = [1, 2, 5, 10, 20, 50, 100];
+const ALLOWED_AMOUNTS = [0.1, 1, 2, 5, 10, 20, 50, 100];
 
 // ---------- PayWay client (null បើគ្មាន credentials) ----------
 let payway = null;
