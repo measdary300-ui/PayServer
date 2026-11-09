@@ -1,0 +1,18 @@
+{
+  "name": "payserver",
+  "version": "1.0.0",
+  "description": "PayServer — ABA PayWay KHQR auto top-up server for the Telegram Drama Mini App",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "payway-ts": "^0.3.1",
+    "qrcode": "^1.5.4"
+  }
+}
