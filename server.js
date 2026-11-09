@@ -1,5 +1,10 @@
 // ============================================================
-// PayServer v1.0.0 — ABA PayWay KHQR auto top-up server
+// PayServer v1.0.2 — ABA PayWay KHQR auto top-up server
+// v1.0.2: primary = dedicated QR API (/generate-qr, JSON, returns qrImage
+//   PNG directly — §5.1/§8.1 of the ABA reference), fallback = /purchase
+//   (SDK) with fixed parsing (status code "0" not "00", camelCase qrString/
+//   qrImage, nested `data`). tran_id shortened to ≤20 chars (ABA limit).
+//   Full raw responses logged so any future PayWay shape change is visible.
 // for the Telegram Drama Mini App (Drama mini app)
 // ------------------------------------------------------------
 // តើ server នេះធ្វើអ្វី?
@@ -26,6 +31,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
@@ -117,9 +123,13 @@ function creditTopup(tranId) {
 }
 
 // ---------- helpers ----------
+let tranSeq = 0;
 function makeTranId(telegramId) {
-  const rand = Math.random().toString(36).slice(2, 6); // 4 តួអក្សរ
-  return `D${String(telegramId)}-${Date.now().toString(36)}${rand}`;
+  // tran_id ត្រូវ ≤ 20 តួ (ABA /generate-qr limit) — D + 6 ខ្ទង់ចុងក្រោយ
+  // របស់ telegramId + timestamp base36 + counter 2 តួ (អតិបរមា 17 តួ).
+  // Counter ធានាថា unique សូម្បីបង្កើតច្រើនដងក្នុង 1ms ដូចគ្នា.
+  const seq = (tranSeq++ % 1296).toString(36).padStart(2, '0');
+  return `D${String(telegramId).slice(-6)}${Date.now().toString(36)}${seq}`;
 }
 
 // ទាញ message ដែលអានបានពី PayWay error (អត់ leak api key!)
@@ -134,6 +144,102 @@ function paywayErrorMessage(err) {
     if (err && err.message) return String(err.message).slice(0, 200);
   } catch (_) { /* ignore */ }
   return 'PayWay error';
+}
+
+// ទាញ QR / deeplink / checkout URL ពី PayWay create response.
+// ហេតុផល៖ PayWay ប្តូរទម្រង់ response តាម endpoint/environment —
+//   flat (top-level: qr_string, abapay_deeplink, checkout_qr_url)
+//   ឬ nested (ក្រោម `data`, ដូច check-transaction response),
+//   status.code អាចជា string '00' ឬ number 0.
+// ដូច្នេះរកគ្រប់កន្លែងដែលអាច — កុំបរាជ័យព្រោះតែ key នៅកន្លែងផ្សេង!
+function extractPaywayQr(result) {
+  if (!result || typeof result !== 'object') return { okCode: false, code: null, msg: '', qrString: null, deeplink: null, checkoutUrl: null };
+  const data = (result.data && typeof result.data === 'object') ? result.data : {};
+  const pick = (...keys) => {
+    for (const k of keys) {
+      const v = (result[k] !== undefined && result[k] !== null && result[k] !== '') ? result[k]
+        : (data[k] !== undefined && data[k] !== null && data[k] !== '') ? data[k] : null;
+      if (v !== null) return v;
+    }
+    return null;
+  };
+  const codeRaw = (result.status && result.status.code !== undefined && result.status.code !== null)
+    ? result.status.code
+    : (data.status && data.status.code !== undefined && data.status.code !== null ? data.status.code : null);
+  const code = (codeRaw === null || codeRaw === undefined) ? null : String(codeRaw);
+  const msg = (result.status && result.status.message)
+    ? String(result.status.message)
+    : (data.status && data.status.message ? String(data.status.message) : '');
+  return {
+    okCode: code === '00' || code === '0',
+    code, msg,
+    qrString: pick('qr_string', 'qrString', 'qr'),
+    qrImage: pick('qrImage', 'qr_image'),
+    deeplink: pick('abapay_deeplink', 'deeplink'),
+    checkoutUrl: pick('checkout_qr_url', 'checkout_url', 'qr_url')
+  };
+}
+
+// ---------- /generate-qr (QR API — វិធីបង្កើត KHQR ដោយផ្ទាល់) ----------
+// POST JSON ទៅ /api/payment-gateway/v1/payments/generate-qr
+// Response: {status:{code:"0",message:""}, qrString, qrImage (PNG data URL
+//   ពី ABA), abapay_deeplink, tran_id}
+// Hash (§8.1, 18 fields, base64 HMAC-SHA512): req_time, merchant_id, tran_id,
+// amount, items, first_name, last_name, email, phone, purchase_type,
+// payment_option, callback_url, return_deeplink, currency, custom_fields,
+// return_params, payout, lifetime, qr_image_template
+// (field ដែលអត់ប្រើ = '' ក្នុង hash, និង omit ចេញពី body ទាំងស្រុង)
+function paywayReqTime(date) {
+  const d = date || new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return String(d.getUTCFullYear()).padStart(4, '0') + p(d.getUTCMonth() + 1) + p(d.getUTCDate())
+    + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds());
+}
+
+function generateQrHash(values) {
+  return crypto.createHmac('sha512', PAYWAY_API_KEY).update(values.join('')).digest('base64');
+}
+
+async function createQrViaGenerateQr(tranId, amount) {
+  const reqTime = paywayReqTime();
+  const itemsB64 = Buffer.from(JSON.stringify([{ name: 'Wallet Top Up', price: amount, quantity: 1 }])).toString('base64');
+  const callbackB64 = PUBLIC_URL ? Buffer.from(PUBLIC_URL + '/api/payway/callback').toString('base64') : '';
+  const lifetime = 5; // នាទី — min 3, default 5 (ABA QR API)
+  const template = 'template3_color';
+  const hash = generateQrHash([
+    reqTime, PAYWAY_MERCHANT_ID, tranId, String(amount), itemsB64,
+    '', '', '', '', // first_name, last_name, email, phone
+    'purchase', 'abapay_khqr', callbackB64, '', // purchase_type, payment_option, callback_url, return_deeplink
+    'USD', '', '', '', // currency, custom_fields, return_params, payout
+    String(lifetime), template
+  ]);
+  const body = {
+    req_time: reqTime,
+    merchant_id: PAYWAY_MERCHANT_ID,
+    tran_id: tranId,
+    amount: amount,
+    items: itemsB64,
+    purchase_type: 'purchase',
+    payment_option: 'abapay_khqr',
+    currency: 'USD',
+    lifetime: lifetime,
+    qr_image_template: template,
+    hash: hash
+  };
+  if (callbackB64) body.callback_url = callbackB64;
+  const url = PAYWAY_BASE_URL.replace(/\/$/, '') + '/api/payment-gateway/v1/payments/generate-qr';
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const text = await resp.text();
+  try { console.log(`[PayServer] generate-qr raw for ${tranId}: ${text.slice(0, 1500)}`); } catch (_) {}
+  let result = null;
+  try {
+    result = JSON.parse(text);
+  } catch (_) {
+    // PayWay ត្រឡប់ HTML (error page / maintenance) — log snippet ហើយបរាជ័យ
+    const snippet = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+    throw new Error(`PayWay generate-qr returned HTML (not JSON): ${snippet || '(empty)'}`);
+  }
+  return result;
 }
 
 // ---------- app ----------
@@ -169,54 +275,76 @@ app.post('/api/topup/create', async (req, res) => {
   }
 
   const tranId = makeTranId(telegramId);
+  // 1) សាក QR API (/generate-qr) មុន — API ដែលបង្កើត KHQR ដោយផ្ទាល់
+  let qr = null;
+  let lastError = '';
   try {
-    const payload = payway.buildTransactionPayload({
-      tran_id: tranId,
-      payment_option: 'abapay_khqr',
-      amount: amount,
-      currency: 'USD',
-      lifetime: 10, // 10 នាទី (PayWay lifetime unit = minutes) — ត្រូវគ្នានឹង server expiry
-      ...(PUBLIC_URL ? { return_url: PUBLIC_URL + '/api/payway/callback' } : {})
-    });
-    const result = await payway.execute(payload);
-
-    // PayWay ប្រាប់ success តែពេល status.code === '00' និងមាន qr_string
-    if (!result || !result.status || result.status.code !== '00' || !result.qr_string) {
-      const msg = (result && result.status && result.status.message)
-        ? String(result.status.message)
-        : 'PayWay did not return a QR';
-      console.warn(`[PayServer] PayWay create failed for ${tranId}: ${msg}`);
-      return res.status(502).json({ ok: false, error: `PayWay: ${msg} / PayWay មិនបានបង្កើត QR` });
-    }
-
-    // រក្សា pending record
-    const topups = loadTopups();
-    topups[tranId] = {
-      telegramId: String(telegramId),
-      amount: amount,
-      status: 'pending',
-      credited: false,
-      createdAt: new Date().toISOString()
-    };
-    saveTopups(topups);
-
-    // QR string → PNG data URL (សម្រាប់បង្ហាញក្នុង Mini App)
-    const qrImage = await QRCode.toDataURL(result.qr_string, { margin: 1, width: 400 });
-
-    return res.json({
-      ok: true,
-      tran_id: tranId,
-      qr_image: qrImage,
-      abapay_deeplink: result.abapay_deeplink || null,
-      checkout_qr_url: result.checkout_qr_url || null,
-      amount: amount,
-      expires_in: TOPUP_QR_EXPIRES_IN
-    });
-  } catch (err) {
-    const msg = paywayErrorMessage(err);
-    console.warn(`[PayServer] PayWay create error for ${tranId}: ${msg}`);
-    return res.status(502).json({ ok: false, error: `PayWay: ${msg} / បង្កើតការបង់ប្រាក់មិនបាន សូមសាកម្តងទៀត` });
+    const genResult = await createQrViaGenerateQr(tranId, amount);
+    const q1 = extractPaywayQr(genResult);
+    if (q1.okCode || q1.qrString || q1.qrImage || q1.checkoutUrl) qr = q1;
+    else lastError = q1.msg || 'generate-qr did not return a QR';
+  } catch (e) {
+    lastError = e && e.message ? String(e.message).slice(0, 300) : 'generate-qr failed';
+    console.warn(`[PayServer] generate-qr failed for ${tranId}: ${lastError}`);
+    qr = null;
   }
+  // 2) បើ QR API បរាជ័យ → fallback ទៅ /purchase (SDK)
+  if (!qr) {
+    try {
+      const payload = payway.buildTransactionPayload({
+        tran_id: tranId,
+        payment_option: 'abapay_khqr',
+        amount: amount,
+        currency: 'USD',
+        lifetime: 10,
+        ...(PUBLIC_URL ? { return_url: PUBLIC_URL + '/api/payway/callback' } : {})
+      });
+      const result = await payway.execute(payload, { allowHtml: true });
+      if (typeof result === 'string') {
+        // PayWay ត្រឡប់ HTML (error page / hosted checkout) — log snippet
+        const snippet = result.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
+        console.warn(`[PayServer] /purchase returned HTML for ${tranId}: ${snippet || '(empty)'}`);
+        lastError = 'PayWay returned an HTML page instead of a QR (sandbox issue?)';
+      } else {
+        try { console.log(`[PayServer] /purchase raw for ${tranId}: ${JSON.stringify(result).slice(0, 1500)}`); } catch (_) {}
+        const q2 = extractPaywayQr(result);
+        if (q2.okCode || q2.qrString || q2.qrImage || q2.checkoutUrl) qr = q2;
+        else lastError = q2.msg || 'purchase did not return a QR';
+      }
+    } catch (e) {
+      lastError = paywayErrorMessage(e);
+      console.warn(`[PayServer] /purchase failed for ${tranId}: ${lastError}`);
+    }
+  }
+  if (!qr || (!qr.qrString && !qr.qrImage && !qr.checkoutUrl)) {
+    return res.status(502).json({ ok: false, error: `PayWay: ${lastError || 'did not return a QR'} / PayWay មិនបានបង្កើត QR សូមសាកម្តងទៀត ឬប្រើវិធី Manual` });
+  }
+
+  // រក្សា pending record
+  const topups = loadTopups();
+  topups[tranId] = {
+    telegramId: String(telegramId),
+    amount: amount,
+    status: 'pending',
+    credited: false,
+    createdAt: new Date().toISOString()
+  };
+  saveTopups(topups);
+
+  // QR image: ប្រើ qrImage ពី ABA (PNG) បើមាន, បើអត់ render ពី qrString
+  let qrImage = qr.qrImage || null;
+  if (!qrImage && qr.qrString) qrImage = await QRCode.toDataURL(qr.qrString, { margin: 1, width: 400 });
+
+  return res.json({
+    ok: true,
+    tran_id: tranId,
+    qr_image: qrImage,
+    pay_via_url: !qrImage && !!qr.checkoutUrl,
+    abapay_deeplink: qr.deeplink || null,
+    checkout_qr_url: qr.checkoutUrl || null,
+    amount: amount,
+    expires_in: TOPUP_QR_EXPIRES_IN
+  });
 });
 
 // ---------- GET /api/topup/status/:tranId ----------
@@ -326,4 +454,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS };
+module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, createQrViaGenerateQr };
