@@ -1,10 +1,8 @@
 // ============================================================
-// PayServer v1.0.2 — ABA PayWay KHQR auto top-up server
-// v1.0.2: primary = dedicated QR API (/generate-qr, JSON, returns qrImage
-//   PNG directly — §5.1/§8.1 of the ABA reference), fallback = /purchase
-//   (SDK) with fixed parsing (status code "0" not "00", camelCase qrString/
-//   qrImage, nested `data`). tran_id shortened to ≤20 chars (ABA limit).
-//   Full raw responses logged so any future PayWay shape change is visible.
+// PayServer v1.0.4 — ABA PayWay KHQR auto top-up server
+// v1.0.4: ចំនួន $0.10 សម្រាប់សាកបង់តិចៗ + expires_in 180 → 360 វិនាទី
+//   (6 នាទី — ត្រូវនឹង PayWay lifetime) ដើម្បីឲ្យ Mini App poll រហូតដល់
+//   QR ផុតកំណត់ពិត ទើបលោត popup ប្រាប់។
 // for the Telegram Drama Mini App (Drama mini app)
 // ------------------------------------------------------------
 // តើ server នេះធ្វើអ្វី?
@@ -44,8 +42,8 @@ const PAYWAY_MERCHANT_ID = (process.env.PAYWAY_MERCHANT_ID || '').trim();
 const PAYWAY_API_KEY = (process.env.PAYWAY_API_KEY || '').trim();
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
 const TOPUP_EXPIRY_MS = 10 * 60 * 1000; // 10 នាទី — បន្ទាប់ពីហ្នឹង topup នឹង expired
-const TOPUP_QR_EXPIRES_IN = 180;        // 180 វិនាទី — បង្ហាញក្នុង Mini App
-const ALLOWED_AMOUNTS = [1, 2, 5, 10, 20, 50, 100];
+const TOPUP_QR_EXPIRES_IN = 360;        // 360 វិនាទី (6 នាទី) — ត្រូវនឹង PayWay lifetime 6 នាទី; Mini App poll រហូតដល់ពេលនេះ
+const ALLOWED_AMOUNTS = [0.1, 1, 2, 5, 10, 20, 50, 100];
 
 // ---------- PayWay client (null បើគ្មាន credentials) ----------
 let payway = null;
@@ -200,11 +198,16 @@ function generateQrHash(values) {
   return crypto.createHmac('sha512', PAYWAY_API_KEY).update(values.join('')).digest('base64');
 }
 
-async function createQrViaGenerateQr(tranId, amount) {
+// បង្កើត body សម្រាប់ /generate-qr (JSON).
+// ចំណាំសំខាន់៖ first_name/last_name/email/phone ត្រូវផ្ញើជា "" (Python SDK
+// "required by api" — v1.0.2 omit វាចោល PayWay ត្រឡប់ code 96
+// "Invalid merchant data"). Hash (§8.1) មិនផ្លាស់ប្តូរទេ ព្រោះ ""
+// មិនបន្ថែមអ្វីទៅ concatenation.
+function buildGenerateQrBody(tranId, amount) {
   const reqTime = paywayReqTime();
   const itemsB64 = Buffer.from(JSON.stringify([{ name: 'Wallet Top Up', price: amount, quantity: 1 }])).toString('base64');
   const callbackB64 = PUBLIC_URL ? Buffer.from(PUBLIC_URL + '/api/payway/callback').toString('base64') : '';
-  const lifetime = 5; // នាទី — min 3, default 5 (ABA QR API)
+  const lifetime = 6; // នាទី — Python SDK default (min 3)
   const template = 'template3_color';
   const hash = generateQrHash([
     reqTime, PAYWAY_MERCHANT_ID, tranId, String(amount), itemsB64,
@@ -218,6 +221,10 @@ async function createQrViaGenerateQr(tranId, amount) {
     merchant_id: PAYWAY_MERCHANT_ID,
     tran_id: tranId,
     amount: amount,
+    first_name: '',
+    last_name: '',
+    email: '',
+    phone: '',
     items: itemsB64,
     purchase_type: 'purchase',
     payment_option: 'abapay_khqr',
@@ -227,8 +234,17 @@ async function createQrViaGenerateQr(tranId, amount) {
     hash: hash
   };
   if (callbackB64) body.callback_url = callbackB64;
+  return body;
+}
+
+async function createQrViaGenerateQr(tranId, amount) {
+  const body = buildGenerateQrBody(tranId, amount);
   const url = PAYWAY_BASE_URL.replace(/\/$/, '') + '/api/payment-gateway/v1/payments/generate-qr';
-  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': 'PayServer/1.0.3 (aba-payway)' },
+    body: JSON.stringify(body)
+  });
   const text = await resp.text();
   try { console.log(`[PayServer] generate-qr raw for ${tranId}: ${text.slice(0, 1500)}`); } catch (_) {}
   let result = null;
@@ -240,6 +256,54 @@ async function createQrViaGenerateQr(tranId, amount) {
     throw new Error(`PayWay generate-qr returned HTML (not JSON): ${snippet || '(empty)'}`);
   }
   return result;
+}
+
+// ទាញ URLs ទាំងអស់ចេញពី HTML (សម្រាប់ពេល PayWay ត្រឡប់ checkout page)
+function extractUrlsFromHtml(html) {
+  const urls = [];
+  const re = /https?:\/\/[^\s"'<>]+/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (!urls.includes(m[0])) urls.push(m[0]);
+    if (urls.length >= 10) break;
+  }
+  return urls;
+}
+
+// /purchase fallback — ផ្ញើជា application/x-www-form-urlencoded
+// (តាម reference project §5.2 — SDK ផ្ញើ multipart ដែល PayWay
+// ត្រឡប់ HTML checkout page មកវិញជំនួស JSON). ត្រឡប់ extractPaywayQr
+// result (ឬ null បើគ្មាន QR) — និង log raw response សម្រាប់ debug.
+async function createQrViaPurchase(tranId, amount) {
+  const payload = payway.buildTransactionPayload({
+    tran_id: tranId,
+    payment_option: 'abapay_khqr',
+    amount: amount,
+    currency: 'USD',
+    lifetime: 10,
+    ...(PUBLIC_URL ? { return_url: PUBLIC_URL + '/api/payway/callback' } : {})
+  });
+  const formBody = new URLSearchParams();
+  for (const [k, v] of Object.entries(payload.fields)) formBody.append(k, String(v));
+  const resp = await fetch(payload.url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json', 'User-Agent': 'PayServer/1.0.3 (aba-payway)' },
+    body: formBody.toString()
+  });
+  const text = await resp.text();
+  let result = null;
+  try {
+    result = JSON.parse(text);
+  } catch (_) {
+    // PayWay ត្រឡប់ HTML checkout page — រក checkout/qr URL ក្នុងវា
+    const urls = extractUrlsFromHtml(text);
+    console.warn(`[PayServer] /purchase returned HTML for ${tranId}: urls=${JSON.stringify(urls)}`);
+    const checkout = urls.find(u => /checkout|payway|qr/i.test(u));
+    if (checkout) return { okCode: true, code: '0', msg: '', qrString: null, qrImage: null, deeplink: null, checkoutUrl: checkout };
+    return null;
+  }
+  try { console.log(`[PayServer] /purchase raw for ${tranId}: ${text.slice(0, 1500)}`); } catch (_) {}
+  return extractPaywayQr(result);
 }
 
 // ---------- app ----------
@@ -288,29 +352,12 @@ app.post('/api/topup/create', async (req, res) => {
     console.warn(`[PayServer] generate-qr failed for ${tranId}: ${lastError}`);
     qr = null;
   }
-  // 2) បើ QR API បរាជ័យ → fallback ទៅ /purchase (SDK)
+  // 2) បើ QR API បរាជ័យ → fallback ទៅ /purchase (urlencoded)
   if (!qr) {
     try {
-      const payload = payway.buildTransactionPayload({
-        tran_id: tranId,
-        payment_option: 'abapay_khqr',
-        amount: amount,
-        currency: 'USD',
-        lifetime: 10,
-        ...(PUBLIC_URL ? { return_url: PUBLIC_URL + '/api/payway/callback' } : {})
-      });
-      const result = await payway.execute(payload, { allowHtml: true });
-      if (typeof result === 'string') {
-        // PayWay ត្រឡប់ HTML (error page / hosted checkout) — log snippet
-        const snippet = result.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300);
-        console.warn(`[PayServer] /purchase returned HTML for ${tranId}: ${snippet || '(empty)'}`);
-        lastError = 'PayWay returned an HTML page instead of a QR (sandbox issue?)';
-      } else {
-        try { console.log(`[PayServer] /purchase raw for ${tranId}: ${JSON.stringify(result).slice(0, 1500)}`); } catch (_) {}
-        const q2 = extractPaywayQr(result);
-        if (q2.okCode || q2.qrString || q2.qrImage || q2.checkoutUrl) qr = q2;
-        else lastError = q2.msg || 'purchase did not return a QR';
-      }
+      const q2 = await createQrViaPurchase(tranId, amount);
+      if (q2 && (q2.okCode || q2.qrString || q2.qrImage || q2.checkoutUrl)) qr = q2;
+      else lastError = (q2 && q2.msg) || 'purchase did not return a QR';
     } catch (e) {
       lastError = paywayErrorMessage(e);
       console.warn(`[PayServer] /purchase failed for ${tranId}: ${lastError}`);
@@ -454,4 +501,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, createQrViaGenerateQr };
+module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml };
