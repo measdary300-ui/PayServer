@@ -1,5 +1,11 @@
 // ============================================================
-// PayServer v1.0.4 — ABA PayWay KHQR auto top-up server
+// PayServer v1.1.0 — ABA PayWay KHQR auto top-up server
+// v1.1.0: + license endpoints (1 Key = 1 PC, online verify)
+//   for the SR Downloader PC app (Electron).
+//   POST /api/license/create | /verify | /unbind
+//   GET  /api/license/list  (+ /health reports license/sheets)
+//   Keys are stored in licenses.json and (optionally) logged to a
+//   Google Sheet. PayWay / top-up / wallet code is UNCHANGED.
 // v1.0.4: ចំនួន $0.10 សម្រាប់សាកបង់តិចៗ + expires_in 180 → 360 វិនាទី
 //   (6 នាទី — ត្រូវនឹង PayWay lifetime) ដើម្បីឲ្យ Mini App poll រហូតដល់
 //   QR ផុតកំណត់ពិត ទើបលោត popup ប្រាប់។
@@ -21,6 +27,14 @@
 //   PUBLIC_URL         — (optional) public URL របស់ server នេះ
 //                        (ប្រើជា return_url ឲ្យ PayWay)
 //   PORT               — default 3002
+//   LICENSE_ADMIN_SECRET — secret for /api/license/create, /unbind,
+//                        /list (header X-Admin-Secret). Generate with
+//                        crypto.randomBytes(32).toString('hex').
+//   GOOGLE_SERVICE_ACCOUNT_JSON — (optional) service-account JSON
+//                        as a single-line JSON string.
+//   SHEET_ID           — (optional) Google Sheet ID for license log.
+//                        Without these two, Sheets logging is off
+//                        and licenses.json still works fully.
 // ------------------------------------------------------------
 // Stores (local JSON — សម្រាប់ production ប្រើ Railway Volume!):
 //   wallets.json — {[telegramId]: {balance, vip, txns:[{tran_id,amount,at}]}}
@@ -54,6 +68,43 @@ if (PAYWAY_MERCHANT_ID && PAYWAY_API_KEY) {
   console.log('[PayServer] WARNING: PAYWAY_MERCHANT_ID / PAYWAY_API_KEY not set — PayWay calls will fail cleanly, server still runs.');
 }
 
+// ---------- License config (v1.1.0 — SR Downloader 1 Key = 1 PC) ----------
+// LICENSE_ADMIN_SECRET — set in Railway Variables only, never in code.
+// GOOGLE_SERVICE_ACCOUNT_JSON + SHEET_ID — optional; without them the
+// server runs WITHOUT Google Sheets (licenses.json still works fully).
+const LICENSE_ADMIN_SECRET = (process.env.LICENSE_ADMIN_SECRET || '').trim();
+const SHEET_ID = (process.env.SHEET_ID || '').trim();
+const SHEET_HEADERS = ['Key', 'Buyer', 'Telegram', 'Machine ID', 'Created', 'Expires', 'Status'];
+
+// googleapis is optional at runtime: if it is not installed (or the env
+// vars are missing) Sheets logging is simply off — never crash the server.
+let google = null;
+try { ({ google } = require('googleapis')); } catch (_) { google = null; }
+let sheetsClient = null; // lazy: sheets.spreadsheets.values (real or injected fake)
+let sheetsHeadersEnsured = false;
+function sheetsConfigured() {
+  return !!(google && SHEET_ID && process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+}
+function getSheetsClient() {
+  if (sheetsClient) return sheetsClient;
+  if (!sheetsConfigured()) return null;
+  try {
+    const creds = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth = new google.auth.GoogleAuth({ credentials: creds, scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+    sheetsClient = google.sheets({ version: 'v4', auth }).spreadsheets.values;
+  } catch (e) {
+    console.warn('[PayServer] WARNING: could not init Google Sheets client:', e.message, '— Sheets logging off.');
+    sheetsClient = null;
+  }
+  return sheetsClient;
+}
+if (!LICENSE_ADMIN_SECRET) {
+  console.log('[PayServer] WARNING: LICENSE_ADMIN_SECRET not set — /api/license/create, /unbind, /list will return 401.');
+}
+if (!sheetsConfigured()) {
+  console.log('[PayServer] WARNING: Google Sheets not configured (need GOOGLE_SERVICE_ACCOUNT_JSON + SHEET_ID) — license log stays in licenses.json only.');
+}
+
 // ---------- JSON stores (atomic write, tolerate missing/corrupt) ----------
 const WALLETS_FILE = path.join(__dirname, 'wallets.json');
 const TOPUPS_FILE = path.join(__dirname, 'topups.json');
@@ -84,6 +135,17 @@ function loadWallets() { return loadJson(WALLETS_FILE, {}); }
 function loadTopups() { return loadJson(TOPUPS_FILE, {}); }
 function saveWallets(w) { saveJson(WALLETS_FILE, w); }
 function saveTopups(t) { saveJson(TOPUPS_FILE, t); }
+
+// ---------- Licenses store (v1.1.2) ----------
+// licenses.json — { NORMALIZED_KEY: { key (normalized), displayKey
+//   (dashed, human-readable), buyer, telegram, createdAt, expiresAt
+//   (ISO string or null = lifetime), machineId (null until bound),
+//   boundAt, previousMachineId, blockedMachineIds (PCs the key moved
+//   away from — blocked until admin unbind), rebindCount, rebindHistory,
+//   status: 'active'|'revoked', lastVerifiedAt } }
+const LICENSES_FILE = path.join(__dirname, 'licenses.json');
+function loadLicenses() { return loadJson(LICENSES_FILE, {}); }
+function saveLicenses(l) { saveJson(LICENSES_FILE, l); }
 
 function getWallet(wallets, telegramId) {
   const id = String(telegramId);
@@ -306,6 +368,142 @@ async function createQrViaPurchase(tranId, amount) {
   return extractPaywayQr(result);
 }
 
+// ---------- Licenses (v1.1.2 — SR Downloader: 1 Key = 1 PC AT A TIME) ----------
+// Keys float: any valid key may move to a new PC when online (re-bind
+// replaces the old binding, logged in rebindCount/rebindHistory).
+// v1.1.2: the PC a key moved AWAY from is BLOCKED for that key
+// (blockedMachineIds) — it can never use the key again until an admin
+// unbinds it. The block only takes effect when that PC goes ONLINE
+// (an offline PC keeps working until its 7-day grace ends —
+// there is no way to reach an offline PC).
+// Offline use still works 7 days from the last successful verify.
+// Key format: SRD-XXXX-XXXX-XXXX-XXXX, uppercase alphanumerics excluding
+// confusing chars 0/O and 1/I.
+// The Electron app NORMALIZES keys before sending (trims, strips
+// dashes/spaces, uppercases), so the server compares keys ONLY in
+// normalized form: strip all dashes/spaces, uppercase.
+//   display form (dashed, human-readable): SRD-ABCD-EFGH-IJKL-MNOP
+//   stored/canonical form (normalized):    SRDABCDEFGHIJKLMNOP
+// licenses.json is keyed by the NORMALIZED key; each record also keeps
+// displayKey (dashed) for humans and for the Google Sheet row.
+const LICENSE_KEY_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function normalizeKey(key) {
+  if (typeof key !== 'string') return '';
+  return key.replace(/[-\s]/g, '').toUpperCase();
+}
+function generateLicenseKey() {
+  const rand = crypto.randomBytes(16);
+  let out = 'SRD';
+  for (let g = 0; g < 4; g++) {
+    out += '-';
+    for (let i = 0; i < 4; i++) out += LICENSE_KEY_CHARS[rand[g * 4 + i] % LICENSE_KEY_CHARS.length];
+  }
+  return out;
+}
+
+// Parse expiry input into an ISO string or null (lifetime).
+// Accepts: ISO date string, DD/MM/YYYY, or expiresInDays (number).
+// Returns { expiresAt } on success or { error } on bad input.
+function parseLicenseExpiry(body) {
+  const b = body || {};
+  if (b.expiresAt !== undefined && b.expiresAt !== null && b.expiresAt !== '') {
+    const raw = String(b.expiresAt).trim();
+    const dm = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); // DD/MM/YYYY
+    if (dm) {
+      const d = new Date(Date.UTC(+dm[3], +dm[2] - 1, +dm[1], 0, 0, 0));
+      if (d.getUTCFullYear() !== +dm[3] || d.getUTCMonth() !== +dm[2] - 1 || d.getUTCDate() !== +dm[1]) {
+        return { error: 'expiresAt is not a valid DD/MM/YYYY date' };
+      }
+      return { expiresAt: d.toISOString() };
+    }
+    const d = new Date(raw); // ISO date string
+    if (isNaN(d.getTime())) return { error: 'expiresAt is not a valid date' };
+    return { expiresAt: d.toISOString() };
+  }
+  if (b.expiresInDays !== undefined && b.expiresInDays !== null && b.expiresInDays !== '') {
+    const n = Number(b.expiresInDays);
+    if (!Number.isFinite(n) || n <= 0) return { error: 'expiresInDays must be a positive number' };
+    return { expiresAt: new Date(Date.now() + n * 24 * 60 * 60 * 1000).toISOString() };
+  }
+  return { expiresAt: null }; // lifetime
+}
+
+function isLicenseExpired(lic) {
+  return !!(lic.expiresAt && Date.now() > new Date(lic.expiresAt).getTime());
+}
+
+// Admin check for /api/license/create, /unbind, /list.
+// Header X-Admin-Secret must equal LICENSE_ADMIN_SECRET.
+function requireLicenseAdmin(req, res) {
+  const sent = (req.headers['x-admin-secret'] || '').trim();
+  if (!LICENSE_ADMIN_SECRET || !sent || sent !== LICENSE_ADMIN_SECRET) {
+    res.status(401).json({ ok: false, error: 'unauthorized — invalid or missing X-Admin-Secret' });
+    return false;
+  }
+  return true;
+}
+
+// ---------- Google Sheets license log (all errors caught, never crash) ----------
+// Sheet columns (row 1 headers, exactly):
+//   Key | Buyer | Telegram | Machine ID | Created | Expires | Status
+function licenseToSheetRow(lic) {
+  // Sheet shows the dashed human-readable key (displayKey).
+  return [lic.displayKey || lic.key, lic.buyer || '', lic.telegram || '', lic.machineId || '',
+    lic.createdAt || '', lic.expiresAt || '', lic.status || 'active'];
+}
+async function ensureSheetHeaders(client) {
+  if (sheetsHeadersEnsured) return;
+  try {
+    const got = await client.get({ spreadsheetId: SHEET_ID, range: 'A1:G1' });
+    const row = (got && got.data && got.data.values && got.data.values[0]) || [];
+    const same = SHEET_HEADERS.every((h, i) => row[i] === h);
+    if (!same) {
+      await client.update({ spreadsheetId: SHEET_ID, range: 'A1:G1', valueInputOption: 'RAW', resource: { values: [SHEET_HEADERS] } });
+    }
+    sheetsHeadersEnsured = true;
+  } catch (e) {
+    console.warn('[PayServer] Sheets: could not ensure headers:', e.message);
+  }
+}
+async function sheetsAppendLicense(lic) {
+  const client = getSheetsClient();
+  if (!client) return;
+  try {
+    await ensureSheetHeaders(client);
+    await client.append({
+      spreadsheetId: SHEET_ID, range: 'A:G',
+      valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS',
+      resource: { values: [licenseToSheetRow(lic)] }
+    });
+  } catch (e) {
+    console.warn('[PayServer] Sheets: append failed for', lic.key, '-', e.message);
+  }
+}
+async function sheetsUpdateBind(lic) {
+  const client = getSheetsClient();
+  if (!client) return;
+  try {
+    const got = await client.get({ spreadsheetId: SHEET_ID, range: 'A:A' });
+    const rows = (got && got.data && got.data.values) || [];
+    let rowNum = -1;
+    for (let i = 0; i < rows.length; i++) {
+      // Sheet column A holds the dashed key — compare normalized.
+      if (rows[i] && normalizeKey(rows[i][0]) === lic.key) { rowNum = i + 1; break; } // 1-based
+    }
+    if (rowNum < 0) { // key not in sheet (e.g. created before Sheets) — append it
+      await sheetsAppendLicense(lic);
+      return;
+    }
+    await client.update({ spreadsheetId: SHEET_ID, range: `D${rowNum}`, valueInputOption: 'RAW', resource: { values: [[lic.machineId || '']] } });
+    await client.update({ spreadsheetId: SHEET_ID, range: `G${rowNum}`, valueInputOption: 'RAW', resource: { values: [[lic.status || 'active']] } });
+  } catch (e) {
+    console.warn('[PayServer] Sheets: bind update failed for', lic.key, '-', e.message);
+  }
+}
+// Test hook: inject a fake Sheets client (used by tests/license.test.js).
+// Passing null resets to the real client (re-resolved lazily).
+function __setSheetsClient(client) { sheetsClient = client; sheetsHeadersEnsured = false; }
+
 // ---------- app ----------
 const app = express();
 app.use(cors()); // v1: allow all origins (Mini App នៅលើ GitHub Pages)
@@ -314,7 +512,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // ---------- GET /health ----------
 app.get('/health', (req, res) => {
-  res.json({ ok: true, payway: payway ? 'configured' : 'missing', time: new Date().toISOString() });
+  res.json({ ok: true, payway: payway ? 'configured' : 'missing', license: true, sheets: sheetsConfigured(), time: new Date().toISOString() });
 });
 
 // ---------- POST /api/topup/create ----------
@@ -485,6 +683,121 @@ app.post('/api/payway/callback', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
+// ---------- Licenses (v1.1.2 — SR Downloader: 1 Key = 1 PC AT A TIME) ----------
+// POST /api/license/create — admin only (X-Admin-Secret).
+//   Body: { buyer (required), telegram?, expiresAt? (ISO or DD/MM/YYYY),
+//           expiresInDays? } → { ok, key, expiresAt }
+//   A Sheets failure is logged and NEVER fails the create.
+app.post('/api/license/create', async (req, res) => {
+  if (!requireLicenseAdmin(req, res)) return;
+  const body = req.body || {};
+  const buyer = typeof body.buyer === 'string' ? body.buyer.trim() : '';
+  if (!buyer) return res.status(400).json({ ok: false, error: 'buyer is required' });
+  const telegram = typeof body.telegram === 'string' ? body.telegram.trim() : '';
+  const parsed = parseLicenseExpiry(body);
+  if (parsed.error) return res.status(400).json({ ok: false, error: parsed.error });
+
+  const licenses = loadLicenses();
+  let displayKey = generateLicenseKey();
+  let key = normalizeKey(displayKey);
+  while (licenses[key]) { displayKey = generateLicenseKey(); key = normalizeKey(displayKey); } // avoid collision
+  const lic = {
+    key, // normalized (canonical) — licenses.json is keyed by this
+    displayKey, // dashed, human-readable (shown to buyer + in Sheet)
+    buyer,
+    telegram,
+    createdAt: new Date().toISOString(),
+    expiresAt: parsed.expiresAt,
+    machineId: null,
+    boundAt: null,
+    previousMachineId: null, // last PC before the latest re-bind
+    blockedMachineIds: [], // PCs the key moved AWAY from — blocked until admin unbind
+    rebindCount: 0, // how many times the key moved to a new PC (online)
+    rebindHistory: [], // [{ machineId, at }] — last 10 moves
+    status: 'active',
+    lastVerifiedAt: null
+  };
+  licenses[key] = lic;
+  saveLicenses(licenses);
+  await sheetsAppendLicense(lic); // never throws (errors caught + logged)
+  res.json({ ok: true, key: displayKey, expiresAt: lic.expiresAt });
+});
+
+// POST /api/license/verify — public (called by the PC app on launch).
+//   Body: { key, machineId } → { valid, expiresAt, buyer, rebound }
+//   or { valid:false, error } with error one of:
+//   unknown_key | revoked | expired | moved_to_another_pc
+//   First verify binds the key to that machineId. A later verify from a
+//   DIFFERENT machineId RE-BINDS the key to the new PC (v1.1.1: keys float,
+//   1 PC at a time, move requires internet) — and the PC it moved AWAY
+//   from is BLOCKED for that key (v1.1.2). A blocked PC that verifies
+//   gets { valid:false, error:'moved_to_another_pc' } and can never use
+//   the key again until an admin unbinds it (unbind clears the block).
+//   The block only bites when the old PC goes ONLINE; while offline it
+//   keeps working until its 7-day grace ends.
+//   Expired/revoked keys never re-bind. `rebound` is true only on a move.
+app.post('/api/license/verify', async (req, res) => {
+  const body = req.body || {};
+  const key = normalizeKey(typeof body.key === 'string' ? body.key.trim() : '');
+  const machineId = typeof body.machineId === 'string' ? body.machineId.trim() : '';
+  if (!key || !machineId) return res.status(400).json({ valid: false, error: 'key and machineId are required' });
+
+  const licenses = loadLicenses();
+  const lic = licenses[key];
+  if (!lic) return res.json({ valid: false, error: 'unknown_key' });
+  if (lic.status !== 'active') return res.json({ valid: false, error: 'revoked' });
+  if (isLicenseExpired(lic)) return res.json({ valid: false, error: 'expired' });
+  if (Array.isArray(lic.blockedMachineIds) && lic.blockedMachineIds.includes(machineId)) {
+    return res.json({ valid: false, error: 'moved_to_another_pc' });
+  }
+
+  const firstBind = !lic.machineId;
+  const rebound = !firstBind && lic.machineId !== machineId;
+  if (rebound) {
+    lic.previousMachineId = lic.machineId;
+    lic.blockedMachineIds = Array.isArray(lic.blockedMachineIds) ? lic.blockedMachineIds : [];
+    if (!lic.blockedMachineIds.includes(lic.previousMachineId)) lic.blockedMachineIds.push(lic.previousMachineId);
+    lic.machineId = machineId;
+    lic.boundAt = new Date().toISOString();
+    lic.rebindCount = (lic.rebindCount || 0) + 1;
+    lic.rebindHistory = Array.isArray(lic.rebindHistory) ? lic.rebindHistory : [];
+    lic.rebindHistory.push({ machineId, at: lic.boundAt });
+    if (lic.rebindHistory.length > 10) lic.rebindHistory = lic.rebindHistory.slice(-10);
+  } else if (firstBind) {
+    lic.machineId = machineId;
+    lic.boundAt = new Date().toISOString();
+  }
+  lic.lastVerifiedAt = new Date().toISOString();
+  saveLicenses(licenses);
+  if (firstBind || rebound) await sheetsUpdateBind(lic); // never throws
+  res.json({ valid: true, expiresAt: lic.expiresAt, buyer: lic.buyer, rebound });
+});
+
+// POST /api/license/unbind — admin only (X-Admin-Secret).
+//   Body: { key } → frees the key for another PC (also clears the
+//   blocked-PC list, so a previously moved-away PC may use it again).
+app.post('/api/license/unbind', (req, res) => {
+  if (!requireLicenseAdmin(req, res)) return;
+  const key = normalizeKey(req.body && typeof req.body.key === 'string' ? req.body.key.trim() : '');
+  if (!key) return res.status(400).json({ ok: false, error: 'key is required' });
+  const licenses = loadLicenses();
+  const lic = licenses[key];
+  if (!lic) return res.status(404).json({ ok: false, error: 'unknown key' });
+  lic.machineId = null;
+  lic.boundAt = null;
+  lic.blockedMachineIds = [];
+  lic.previousMachineId = null;
+  saveLicenses(licenses);
+  res.json({ ok: true });
+});
+
+// GET /api/license/list — admin only (X-Admin-Secret).
+app.get('/api/license/list', (req, res) => {
+  if (!requireLicenseAdmin(req, res)) return;
+  const licenses = loadLicenses();
+  res.json({ ok: true, keys: Object.values(licenses) });
+});
+
 // ---------- 404 + error handler ----------
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'not found' });
@@ -501,4 +814,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml };
+module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml, generateLicenseKey, normalizeKey, parseLicenseExpiry, loadLicenses, saveLicenses, isLicenseExpired, __setSheetsClient, SHEET_HEADERS };
