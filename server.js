@@ -1,5 +1,19 @@
 // ============================================================
-// PayServer v1.1.3 — ABA PayWay KHQR auto top-up server
+// PayServer v1.1.4 — ABA PayWay KHQR auto top-up server
+// v1.1.4: + Telegram alert to the admin whenever a user
+//   ACTIVATES a license key on a (new) device. The server sends
+//   a message via the Telegram Bot API (sendMessage) — NO app
+//   change and NO bot change. Trigger ONLY on a successful NEW
+//   activation: weekly keys (activateDevice creates a new entry)
+//   and legacy keys (first bind + rebind to another PC). A repeat
+//   verify of an already-activated device does NOT alert (that
+//   would spam the admin on every app launch), and failed verifies
+//   (expired / device_limit / invalid) do NOT alert either.
+//   FAIL-OPEN: if Telegram is not configured or the send fails,
+//   the activation still succeeds — the error is only logged.
+//   New env vars (same values as the bot's Railway Variables):
+//   BOT_TOKEN + ADMIN_TELEGRAM_ID. Without them, alerting is
+//   silently off (same pattern as the optional Sheets logging).
 // v1.1.3: + public weekly keys (1 key = up to 10 devices,
 //   each device valid N days from ITS OWN activation).
 //   POST /api/license/create accepts maxDevices (1–10) +
@@ -48,6 +62,12 @@
 //   SHEET_ID           — (optional) Google Sheet ID for license log.
 //                        Without these two, Sheets logging is off
 //                        and licenses.json still works fully.
+//   BOT_TOKEN          — (optional, v1.1.4) Telegram bot token,
+//                        SAME value as the bot's Railway Variables.
+//   ADMIN_TELEGRAM_ID  — (optional, v1.1.4) admin chat id to alert,
+//                        SAME value as the bot's Railway Variables.
+//                        Without these two, activation alerts are
+//                        silently off (activation still works).
 // ------------------------------------------------------------
 // Stores (local JSON — សម្រាប់ production ប្រើ Railway Volume!):
 //   wallets.json — {[telegramId]: {balance, vip, txns:[{tran_id,amount,at}]}}
@@ -478,6 +498,87 @@ function licenseMaxDevices(lic) {
   return Number.isInteger(lic.maxDevices) && lic.maxDevices > 0 ? lic.maxDevices : 1;
 }
 
+// ---------- Telegram activation alerts (v1.1.4) ----------
+// Alert the admin (via the Telegram bot) when a user ACTIVATES a key
+// on a (new) device. Server-side only: the app and the bot do not
+// change. Env vars are read LAZILY (like sheetsConfigured) so tests
+// can toggle them without reloading the module.
+// FAIL-OPEN: sendTelegramAlert never throws — a Telegram failure only
+// logs a warning and the activation still succeeds. The verify handler
+// calls notifyActivation WITHOUT awaiting it, so a slow Telegram call
+// can never delay the /verify response.
+function telegramAlertsConfigured() {
+  return !!((process.env.BOT_TOKEN || '').trim() && (process.env.ADMIN_TELEGRAM_ID || '').trim());
+}
+// Mask a key for the alert: SRD-ABCD-EFGH-IJKL-MNOP → SRD-ABCD-••••-••••-MNOP.
+// The full key NEVER appears in any Telegram message.
+function maskLicenseKey(displayKey) {
+  const parts = String(displayKey || '').split('-').filter(Boolean);
+  if (parts.length >= 3) return parts[0] + '-' + parts[1] + '-••••-••••-' + parts[parts.length - 1];
+  return '••••';
+}
+// Format an ISO date as DD/MM/YYYY, HH:mm in Asia/Phnom_Penh.
+function formatPhnomPenh(iso) {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Phnom_Penh', day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false
+    }).format(d);
+  } catch (_) { return ''; }
+}
+// Build the alert text (Khmer-first, plain text — no parse_mode, so
+// buyer names with < > & cannot break the message).
+// event: 'activate' (new device) | 'rebind' (legacy key moved PCs).
+// expiresAt: ISO string for this device, or null = lifetime (legacy).
+function buildActivationAlert({ event, lic, machineId, expiresAt, deviceCount, maxDevices, at }) {
+  const title = event === 'rebind' ? '🔄 Key បានផ្លាស់ទៅ PC ថ្មី' : '🔑 Key ត្រូវបាន Activate';
+  const expiry = expiresAt ? formatPhnomPenh(expiresAt) : 'Lifetime (អត់ផុតកំណត់)';
+  const when = formatPhnomPenh((at || new Date()).toISOString());
+  return [
+    title,
+    '👤 អ្នកទិញ: ' + (lic.buyer || '-'),
+    '🔑 Key: ' + maskLicenseKey(lic.displayKey || lic.key),
+    '💻 PC: ' + String(machineId || '').slice(0, 8) + '…',
+    '📱 Devices: ' + deviceCount + '/' + maxDevices,
+    '⏰ ផុតកំណត់: ' + expiry,
+    '🕐 ' + when
+  ].join('\n');
+}
+async function sendTelegramAlert(text) {
+  if (!telegramAlertsConfigured()) return false;
+  try {
+    const token = (process.env.BOT_TOKEN || '').trim();
+    const chatId = (process.env.ADMIN_TELEGRAM_ID || '').trim();
+    const res = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text })
+    });
+    if (!res.ok) {
+      console.warn('[PayServer] Telegram alert failed: HTTP', res.status);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('[PayServer] Telegram alert failed:', e && e.message ? e.message : e);
+    return false;
+  }
+}
+// Fire-and-forget: builds the message and sends it WITHOUT awaiting
+// the Telegram round-trip. Never throws, never blocks the caller.
+function notifyActivation(args) {
+  try {
+    const text = buildActivationAlert(args);
+    sendTelegramAlert(text).catch((e) => {
+      console.warn('[PayServer] Telegram alert failed:', e && e.message ? e.message : e);
+    });
+  } catch (e) {
+    console.warn('[PayServer] Telegram alert failed:', e && e.message ? e.message : e);
+  }
+}
+
 // Admin check for /api/license/create, /unbind, /list.
 // Header X-Admin-Secret must equal LICENSE_ADMIN_SECRET.
 function requireLicenseAdmin(req, res) {
@@ -573,7 +674,7 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // ---------- GET /health ----------
 app.get('/health', (req, res) => {
-  res.json({ ok: true, payway: payway ? 'configured' : 'missing', license: true, sheets: sheetsConfigured(), time: new Date().toISOString() });
+  res.json({ ok: true, payway: payway ? 'configured' : 'missing', license: true, sheets: sheetsConfigured(), telegram: telegramAlertsConfigured(), time: new Date().toISOString() });
 });
 
 // ---------- POST /api/topup/create ----------
@@ -744,7 +845,7 @@ app.post('/api/payway/callback', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// ---------- Licenses (v1.1.3 — SR Downloader: 1 Key = 1 PC AT A TIME, or a public weekly key) ----------
+// ---------- Licenses (v1.1.4 — SR Downloader: 1 Key = 1 PC AT A TIME, or a public weekly key; v1.1.4 alerts the admin on Telegram at every NEW activation) ----------
 // POST /api/license/create — admin only (X-Admin-Secret).
 //   Body: { buyer (required), telegram?, expiresAt? (ISO or DD/MM/YYYY),
 //           expiresInDays?, maxDevices? (1–10, default 1),
@@ -864,6 +965,14 @@ app.post('/api/license/verify', async (req, res) => {
     lic.lastVerifiedAt = now.toISOString();
     saveLicenses(licenses);
     await sheetsUpdateBind(lic); // never throws — logs the device list
+    // v1.1.4: NEW device activation → alert the admin (fire-and-forget,
+    // never blocks the response). A repeat verify of an already-activated
+    // device reaches the branch above and does NOT alert.
+    notifyActivation({
+      event: 'activate', lic, machineId, expiresAt: newAct.expiresAt,
+      deviceCount: Array.isArray(lic.activations) ? lic.activations.length : 1,
+      maxDevices: licenseMaxDevices(lic), at: now
+    });
     return res.json({ valid: true, expiresAt: newAct.expiresAt, buyer: lic.buyer, rebound: false });
   }
 
@@ -891,6 +1000,16 @@ app.post('/api/license/verify', async (req, res) => {
   lic.lastVerifiedAt = new Date().toISOString();
   saveLicenses(licenses);
   if (firstBind || rebound) await sheetsUpdateBind(lic); // never throws
+  // v1.1.4: first bind AND rebind are NEW activations on a device →
+  // alert the admin (fire-and-forget, never blocks the response).
+  // A repeat verify of the same already-bound PC does NOT alert.
+  if (firstBind || rebound) {
+    notifyActivation({
+      event: rebound ? 'rebind' : 'activate', lic, machineId,
+      expiresAt: lic.expiresAt, deviceCount: 1,
+      maxDevices: licenseMaxDevices(lic), at: new Date()
+    });
+  }
   res.json({ valid: true, expiresAt: lic.expiresAt, buyer: lic.buyer, rebound });
 });
 
@@ -945,4 +1064,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml, generateLicenseKey, normalizeKey, parseLicenseExpiry, loadLicenses, saveLicenses, isLicenseExpired, findActivation, activateDevice, licenseMaxDevices, __setSheetsClient, SHEET_HEADERS };
+module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml, generateLicenseKey, normalizeKey, parseLicenseExpiry, loadLicenses, saveLicenses, isLicenseExpired, findActivation, activateDevice, licenseMaxDevices, telegramAlertsConfigured, maskLicenseKey, formatPhnomPenh, buildActivationAlert, sendTelegramAlert, notifyActivation, __setSheetsClient, SHEET_HEADERS };
