@@ -1,5 +1,18 @@
 // ============================================================
-// PayServer v1.1.0 — ABA PayWay KHQR auto top-up server
+// PayServer v1.1.3 — ABA PayWay KHQR auto top-up server
+// v1.1.3: + public weekly keys (1 key = up to 10 devices,
+//   each device valid N days from ITS OWN activation).
+//   POST /api/license/create accepts maxDevices (1–10) +
+//   activationDays (1–365): such a key has NO fixed expiry
+//   (expiresAt null, activationBased true); each device's
+//   expiry is stored in activations[] as {machineId,
+//   activatedAt, expiresAt}. Verify looks the device up in
+//   activations[] and binds a new device while slots remain.
+//   Legacy keys (no activationDays) use the v1.1.2 flow
+//   EXACTLY as before (1 PC at a time + moved-PC block).
+//   All per-device expiry logic lives in findActivation /
+//   activateDevice, so switching to per-KEY expiry later is
+//   a small change in one place.
 // v1.1.0: + license endpoints (1 Key = 1 PC, online verify)
 //   for the SR Downloader PC app (Electron).
 //   POST /api/license/create | /verify | /unbind
@@ -136,13 +149,20 @@ function loadTopups() { return loadJson(TOPUPS_FILE, {}); }
 function saveWallets(w) { saveJson(WALLETS_FILE, w); }
 function saveTopups(t) { saveJson(TOPUPS_FILE, t); }
 
-// ---------- Licenses store (v1.1.2) ----------
+// ---------- Licenses store (v1.1.3) ----------
 // licenses.json — { NORMALIZED_KEY: { key (normalized), displayKey
 //   (dashed, human-readable), buyer, telegram, createdAt, expiresAt
 //   (ISO string or null = lifetime), machineId (null until bound),
 //   boundAt, previousMachineId, blockedMachineIds (PCs the key moved
 //   away from — blocked until admin unbind), rebindCount, rebindHistory,
-//   status: 'active'|'revoked', lastVerifiedAt } }
+//   status: 'active'|'revoked', lastVerifiedAt,
+//   maxDevices (default 1), activationDays (null = legacy fixed-expiry
+//   key), activationBased (true when activationDays was given at
+//   create), activations: [{ machineId, activatedAt, expiresAt }]
+//   — one entry per device, each with ITS OWN expiry
+//   (activatedAt + activationDays). Legacy records without the new
+//   fields keep working: missing maxDevices = 1, missing
+//   activations = [], missing activationBased = false. } }
 const LICENSES_FILE = path.join(__dirname, 'licenses.json');
 function loadLicenses() { return loadJson(LICENSES_FILE, {}); }
 function saveLicenses(l) { saveJson(LICENSES_FILE, l); }
@@ -432,6 +452,32 @@ function isLicenseExpired(lic) {
   return !!(lic.expiresAt && Date.now() > new Date(lic.expiresAt).getTime());
 }
 
+// ---------- Activation-based keys (v1.1.3 — public weekly keys) ----------
+// ALL per-device expiry logic lives in these two helpers, so the model
+// can change in one place later (e.g. per-KEY expiry: give every device
+// the key's first activationAt + activationDays instead of its own).
+// A license is activation-based when lic.activationBased is true
+// (set at create time by activationDays). Legacy keys never reach here.
+function findActivation(lic, machineId) {
+  const acts = Array.isArray(lic.activations) ? lic.activations : [];
+  return acts.find((a) => a && a.machineId === machineId) || null;
+}
+function activateDevice(lic, machineId, now) {
+  const acts = Array.isArray(lic.activations) ? lic.activations : [];
+  const act = {
+    machineId,
+    activatedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + lic.activationDays * 24 * 60 * 60 * 1000).toISOString()
+  };
+  acts.push(act);
+  lic.activations = acts;
+  return act;
+}
+// Max devices for a key — legacy records without the field default to 1.
+function licenseMaxDevices(lic) {
+  return Number.isInteger(lic.maxDevices) && lic.maxDevices > 0 ? lic.maxDevices : 1;
+}
+
 // Admin check for /api/license/create, /unbind, /list.
 // Header X-Admin-Secret must equal LICENSE_ADMIN_SECRET.
 function requireLicenseAdmin(req, res) {
@@ -446,10 +492,25 @@ function requireLicenseAdmin(req, res) {
 // ---------- Google Sheets license log (all errors caught, never crash) ----------
 // Sheet columns (row 1 headers, exactly):
 //   Key | Buyer | Telegram | Machine ID | Created | Expires | Status
+// Machine ID column (D) for the Sheet. Legacy key: the single bound
+// machineId. Activation-based key: all activated devices, comma-separated
+// (column layout unchanged: Key|Buyer|Telegram|Machine ID|Created|Expires|Status).
+function licenseSheetMachineId(lic) {
+  if (lic.activationBased) {
+    const acts = Array.isArray(lic.activations) ? lic.activations : [];
+    return acts.map((a) => a && a.machineId).filter(Boolean).join(', ');
+  }
+  return lic.machineId || '';
+}
 function licenseToSheetRow(lic) {
   // Sheet shows the dashed human-readable key (displayKey).
-  return [lic.displayKey || lic.key, lic.buyer || '', lic.telegram || '', lic.machineId || '',
-    lic.createdAt || '', lic.expiresAt || '', lic.status || 'active'];
+  // Activation-based key: Expires column reads "7d from activation"
+  // (no fixed date — each device gets its own 7 days).
+  const expires = lic.activationBased
+    ? (lic.activationDays ? lic.activationDays + 'd from activation' : 'from activation')
+    : (lic.expiresAt || '');
+  return [lic.displayKey || lic.key, lic.buyer || '', lic.telegram || '', licenseSheetMachineId(lic),
+    lic.createdAt || '', expires, lic.status || 'active'];
 }
 async function ensureSheetHeaders(client) {
   if (sheetsHeadersEnsured) return;
@@ -494,7 +555,7 @@ async function sheetsUpdateBind(lic) {
       await sheetsAppendLicense(lic);
       return;
     }
-    await client.update({ spreadsheetId: SHEET_ID, range: `D${rowNum}`, valueInputOption: 'RAW', resource: { values: [[lic.machineId || '']] } });
+    await client.update({ spreadsheetId: SHEET_ID, range: `D${rowNum}`, valueInputOption: 'RAW', resource: { values: [[licenseSheetMachineId(lic)]] } });
     await client.update({ spreadsheetId: SHEET_ID, range: `G${rowNum}`, valueInputOption: 'RAW', resource: { values: [[lic.status || 'active']] } });
   } catch (e) {
     console.warn('[PayServer] Sheets: bind update failed for', lic.key, '-', e.message);
@@ -683,10 +744,15 @@ app.post('/api/payway/callback', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// ---------- Licenses (v1.1.2 — SR Downloader: 1 Key = 1 PC AT A TIME) ----------
+// ---------- Licenses (v1.1.3 — SR Downloader: 1 Key = 1 PC AT A TIME, or a public weekly key) ----------
 // POST /api/license/create — admin only (X-Admin-Secret).
 //   Body: { buyer (required), telegram?, expiresAt? (ISO or DD/MM/YYYY),
-//           expiresInDays? } → { ok, key, expiresAt }
+//           expiresInDays?, maxDevices? (1–10, default 1),
+//           activationDays? (1–365) } → { ok, key, expiresAt, maxDevices, activationDays }
+//   activationDays = PUBLIC WEEKLY KEY: the key has NO fixed expiry
+//   (expiresAt null, activationBased true); each device that activates
+//   gets its own expiresAt = activation time + activationDays.
+//   When activationDays is given, expiresAt/expiresInDays are ignored.
 //   A Sheets failure is logged and NEVER fails the create.
 app.post('/api/license/create', async (req, res) => {
   if (!requireLicenseAdmin(req, res)) return;
@@ -694,7 +760,24 @@ app.post('/api/license/create', async (req, res) => {
   const buyer = typeof body.buyer === 'string' ? body.buyer.trim() : '';
   if (!buyer) return res.status(400).json({ ok: false, error: 'buyer is required' });
   const telegram = typeof body.telegram === 'string' ? body.telegram.trim() : '';
-  const parsed = parseLicenseExpiry(body);
+  // maxDevices: 1–10 (default 1 = legacy 1-PC key).
+  let maxDevices = 1;
+  if (body.maxDevices !== undefined && body.maxDevices !== null && body.maxDevices !== '') {
+    maxDevices = Number(body.maxDevices);
+    if (!Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 10) {
+      return res.status(400).json({ ok: false, error: 'maxDevices must be an integer from 1 to 10' });
+    }
+  }
+  // activationDays: 1–365 (optional). Present = activation-based key.
+  let activationDays = null;
+  if (body.activationDays !== undefined && body.activationDays !== null && body.activationDays !== '') {
+    activationDays = Number(body.activationDays);
+    if (!Number.isInteger(activationDays) || activationDays < 1 || activationDays > 365) {
+      return res.status(400).json({ ok: false, error: 'activationDays must be an integer from 1 to 365' });
+    }
+  }
+  const activationBased = activationDays !== null;
+  const parsed = activationBased ? { expiresAt: null } : parseLicenseExpiry(body);
   if (parsed.error) return res.status(400).json({ ok: false, error: parsed.error });
 
   const licenses = loadLicenses();
@@ -715,27 +798,40 @@ app.post('/api/license/create', async (req, res) => {
     rebindCount: 0, // how many times the key moved to a new PC (online)
     rebindHistory: [], // [{ machineId, at }] — last 10 moves
     status: 'active',
-    lastVerifiedAt: null
+    lastVerifiedAt: null,
+    maxDevices, // v1.1.3 — how many devices may activate this key
+    activationDays, // v1.1.3 — null = legacy fixed-expiry key
+    activationBased, // v1.1.3 — true = per-device expiry from activation
+    activations: [] // v1.1.3 — [{ machineId, activatedAt, expiresAt }]
   };
   licenses[key] = lic;
   saveLicenses(licenses);
   await sheetsAppendLicense(lic); // never throws (errors caught + logged)
-  res.json({ ok: true, key: displayKey, expiresAt: lic.expiresAt });
+  res.json({ ok: true, key: displayKey, expiresAt: lic.expiresAt, maxDevices: lic.maxDevices, activationDays: lic.activationDays });
 });
 
 // POST /api/license/verify — public (called by the PC app on launch).
 //   Body: { key, machineId } → { valid, expiresAt, buyer, rebound }
 //   or { valid:false, error } with error one of:
-//   unknown_key | revoked | expired | moved_to_another_pc
-//   First verify binds the key to that machineId. A later verify from a
-//   DIFFERENT machineId RE-BINDS the key to the new PC (v1.1.1: keys float,
-//   1 PC at a time, move requires internet) — and the PC it moved AWAY
-//   from is BLOCKED for that key (v1.1.2). A blocked PC that verifies
-//   gets { valid:false, error:'moved_to_another_pc' } and can never use
-//   the key again until an admin unbinds it (unbind clears the block).
-//   The block only bites when the old PC goes ONLINE; while offline it
-//   keeps working until its 7-day grace ends.
-//   Expired/revoked keys never re-bind. `rebound` is true only on a move.
+//   unknown_key | revoked | expired | moved_to_another_pc | device_limit
+//   LEGACY keys (v1.1.2): first verify binds the key to that machineId.
+//   A later verify from a DIFFERENT machineId RE-BINDS the key to the
+//   new PC (v1.1.1: keys float, 1 PC at a time, move requires internet)
+//   — and the PC it moved AWAY from is BLOCKED for that key (v1.1.2).
+//   A blocked PC that verifies gets { valid:false,
+//   error:'moved_to_another_pc' } and can never use the key again until
+//   an admin unbinds it (unbind clears the block). The block only bites
+//   when the old PC goes ONLINE; while offline it keeps working until
+//   its 7-day grace ends. Expired/revoked keys never re-bind.
+//   `rebound` is true only on a move.
+//   ACTIVATION-BASED keys (v1.1.3, public weekly keys): the legacy flow
+//   does NOT apply. The device is looked up in activations[]: found and
+//   unexpired → valid with THAT device's expiresAt; found and expired →
+//   expired; not found and slots remain (activations.length < maxDevices)
+//   → a new activation is created (now + activationDays) and returned;
+//   not found and full → { valid:false, error:'device_limit' }.
+//   expiresAt in the reply is always the CALLING device's own expiry,
+//   which is exactly what the app stores and counts down from.
 app.post('/api/license/verify', async (req, res) => {
   const body = req.body || {};
   const key = normalizeKey(typeof body.key === 'string' ? body.key.trim() : '');
@@ -746,6 +842,31 @@ app.post('/api/license/verify', async (req, res) => {
   const lic = licenses[key];
   if (!lic) return res.json({ valid: false, error: 'unknown_key' });
   if (lic.status !== 'active') return res.json({ valid: false, error: 'revoked' });
+
+  // v1.1.3 — ACTIVATION-BASED KEY (public weekly key). The legacy
+  // single-machine flow below does NOT apply to these keys.
+  if (lic.activationBased) {
+    const now = new Date();
+    const act = findActivation(lic, machineId);
+    if (act) {
+      if (now.getTime() > new Date(act.expiresAt).getTime()) {
+        return res.json({ valid: false, error: 'expired' });
+      }
+      lic.lastVerifiedAt = now.toISOString();
+      saveLicenses(licenses);
+      return res.json({ valid: true, expiresAt: act.expiresAt, buyer: lic.buyer, rebound: false });
+    }
+    const used = Array.isArray(lic.activations) ? lic.activations.length : 0;
+    if (used >= licenseMaxDevices(lic)) {
+      return res.json({ valid: false, error: 'device_limit' });
+    }
+    const newAct = activateDevice(lic, machineId, now);
+    lic.lastVerifiedAt = now.toISOString();
+    saveLicenses(licenses);
+    await sheetsUpdateBind(lic); // never throws — logs the device list
+    return res.json({ valid: true, expiresAt: newAct.expiresAt, buyer: lic.buyer, rebound: false });
+  }
+
   if (isLicenseExpired(lic)) return res.json({ valid: false, error: 'expired' });
   if (Array.isArray(lic.blockedMachineIds) && lic.blockedMachineIds.includes(machineId)) {
     return res.json({ valid: false, error: 'moved_to_another_pc' });
@@ -776,6 +897,8 @@ app.post('/api/license/verify', async (req, res) => {
 // POST /api/license/unbind — admin only (X-Admin-Secret).
 //   Body: { key } → frees the key for another PC (also clears the
 //   blocked-PC list, so a previously moved-away PC may use it again).
+//   For an activation-based key (v1.1.3) it clears ALL device
+//   activations, freeing every slot (devices must re-activate).
 app.post('/api/license/unbind', (req, res) => {
   if (!requireLicenseAdmin(req, res)) return;
   const key = normalizeKey(req.body && typeof req.body.key === 'string' ? req.body.key.trim() : '');
@@ -787,15 +910,23 @@ app.post('/api/license/unbind', (req, res) => {
   lic.boundAt = null;
   lic.blockedMachineIds = [];
   lic.previousMachineId = null;
+  if (lic.activationBased) lic.activations = []; // free all device slots
   saveLicenses(licenses);
   res.json({ ok: true });
 });
 
 // GET /api/license/list — admin only (X-Admin-Secret).
+//   Each record carries maxDevices (legacy records default to 1) and
+//   activationCount (legacy records: 0).
 app.get('/api/license/list', (req, res) => {
   if (!requireLicenseAdmin(req, res)) return;
   const licenses = loadLicenses();
-  res.json({ ok: true, keys: Object.values(licenses) });
+  const keys = Object.values(licenses).map((lic) => ({
+    ...lic,
+    maxDevices: licenseMaxDevices(lic),
+    activationCount: Array.isArray(lic.activations) ? lic.activations.length : 0
+  }));
+  res.json({ ok: true, keys });
 });
 
 // ---------- 404 + error handler ----------
@@ -814,4 +945,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml, generateLicenseKey, normalizeKey, parseLicenseExpiry, loadLicenses, saveLicenses, isLicenseExpired, __setSheetsClient, SHEET_HEADERS };
+module.exports = { app, creditTopup, loadWallets, loadTopups, makeTranId, ALLOWED_AMOUNTS, extractPaywayQr, paywayReqTime, generateQrHash, buildGenerateQrBody, createQrViaGenerateQr, createQrViaPurchase, extractUrlsFromHtml, generateLicenseKey, normalizeKey, parseLicenseExpiry, loadLicenses, saveLicenses, isLicenseExpired, findActivation, activateDevice, licenseMaxDevices, __setSheetsClient, SHEET_HEADERS };
